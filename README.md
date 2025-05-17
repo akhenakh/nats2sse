@@ -28,6 +28,8 @@ go get github.com/akhenakh/nats2sse
 
 ## Usage
 
+There is an example server in `cmd/server`.
+
 ### 1. Define an Authentication Function
 
 The `AuthFunc` is responsible for authenticating the HTTP request and determining which NATS subject(s) the client should subscribe to. It can also return a `clientID` for logging or creating durable JetStream consumers.
@@ -39,7 +41,7 @@ import (
 )
 
 // SimpleAuth allows any client to subscribe to a subject provided in a query parameter.
-// In a real application, you'd implement proper token validation, ACL checks, etc.
+// In a real application, you'd implement proper token validation, ACL checks, JWT validation, etc.
 func SimpleAuth(r *http.Request) (subject string, clientID string, err error) {
 	token := r.URL.Query().Get("token")
 	subj := r.URL.Query().Get("subject")
