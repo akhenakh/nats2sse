@@ -16,9 +16,7 @@ This was generated 99% using Gemini, it is useful to me use it at your own risk 
 *   Configurable SSE heartbeats for keep-alive.
 *   Optional logger.
 *   JetStream consumer configuration can be customized.
-*   NATS message subject is used as the SSE `event` type.
-*   NATS message data is Base64 encoded for the SSE `data` field.
-*   NATS message header `Nats-Msg-Id` is used as the SSE `id` field if present.
+*   Callbacks for message processing and error handling.
 
 ## Installation
 
@@ -72,7 +70,7 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream" // If using JetStream
-	"github.com/akhenakh/nats2sse"  
+	"github.com/akhenakh/nats2sse"
 )
 
 // Example SimpleAuth (from above)
