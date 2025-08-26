@@ -17,7 +17,8 @@ import (
 	"time"
 
 	nstest "github.com/nats-io/nats-server/v2/test" // Common alias for the test utilities
-	natsclient "github.com/nats-io/nats.go"         // Alias for clarity if needed, or just use nats.go
+	"github.com/nats-io/nats.go"
+	natsclient "github.com/nats-io/nats.go" // Alias for clarity if needed, or just use nats.go
 	"github.com/nats-io/nats.go/jetstream"
 )
 
@@ -350,12 +351,20 @@ func TestNATS2SSEHandler_MessageCallback(t *testing.T) {
 	denyMessageContent := "DENY THIS MESSAGE"
 	allowMessageContent := "ALLOW THIS MESSAGE"
 
-	callback := func(ctx context.Context, clientID, subject string, msgData []byte) error {
+	callback := func(ctx context.Context, clientID, subject string, headers nats.Header, msgData []byte) error {
 		atomic.AddInt32(&callbackHitCount, 1)
-		t.Logf("Callback invoked for client %s, subject %s, data: %s", clientID, subject, string(msgData))
+		t.Logf("Callback invoked for client %s, subject %s, headers %v, data: %s", clientID, subject, headers, string(msgData))
+
+		// Test for a specific header
+		if headers.Get("X-Test-Header") == "deny" {
+			atomic.AddInt32(&deniedCount, 1)
+			t.Logf("Message denied by X-Test-Header for client %s", clientID)
+			return errors.New("denied by test header")
+		}
+
 		if strings.Contains(string(msgData), denyMessageContent) {
 			atomic.AddInt32(&deniedCount, 1)
-			return errors.New("denied by test callback")
+			return errors.New("denied by test callback (content)")
 		}
 		atomic.AddInt32(&successfulCount, 1)
 		return nil
@@ -441,17 +450,36 @@ func TestNATS2SSEHandler_MessageCallback(t *testing.T) {
 	// Give the SSE connection and reader a moment
 	time.Sleep(200 * time.Millisecond)
 
+	// Publish message that should be denied by header
+	denyHeader := make(natsclient.Header)
+	denyHeader.Set("X-Test-Header", "deny")
+	if pubErr := nc.PublishMsg(&natsclient.Msg{
+		Subject: testSubjectCore,
+		Header:  denyHeader,
+		Data:    []byte("Message with deny header"),
+	}); pubErr != nil {
+		t.Fatalf("Failed to publish DENY HEADER message: %v", pubErr)
+	}
+	t.Logf("Published DENY HEADER message")
+	time.Sleep(50 * time.Millisecond) // Give NATS a moment
+
 	// Publish message that should be allowed
-	if pubErr := nc.Publish(testSubjectCore, []byte(allowMessageContent)); pubErr != nil {
+	allowHeader := make(natsclient.Header)
+	allowHeader.Set("Content-Type", "application/json")
+	if pubErr := nc.PublishMsg(&natsclient.Msg{
+		Subject: testSubjectCore,
+		Header:  allowHeader,
+		Data:    []byte(allowMessageContent),
+	}); pubErr != nil {
 		t.Fatalf("Failed to publish ALLOW message: %v", pubErr)
 	}
 	t.Logf("Published ALLOW message: %s", allowMessageContent)
 
-	// Publish message that should be denied by the callback
+	// Publish message that should be denied by the callback content
 	if pubErr := nc.Publish(testSubjectCore, []byte(denyMessageContent)); pubErr != nil {
-		t.Fatalf("Failed to publish DENY message: %v", pubErr)
+		t.Fatalf("Failed to publish DENY CONTENT message: %v", pubErr)
 	}
-	t.Logf("Published DENY message: %s", denyMessageContent)
+	t.Logf("Published DENY CONTENT message: %s", denyMessageContent)
 
 	// Publish another allowed message
 	if pubErr := nc.Publish(testSubjectCore, []byte(allowMessageContent+" 2")); pubErr != nil {
@@ -489,12 +517,12 @@ func TestNATS2SSEHandler_MessageCallback(t *testing.T) {
 	cancel()           // Signal http request to finish
 	sseReaderWG.Wait() // Wait for the SSE reader goroutine to finish
 
-	// Assertions
-	if actual := atomic.LoadInt32(&callbackHitCount); actual != 3 {
-		t.Errorf("Expected callback to be hit 3 times, got %d", actual)
+	// Assertions - FIXED EXPECTATIONS
+	if actual := atomic.LoadInt32(&callbackHitCount); actual != 4 {
+		t.Errorf("Expected callback to be hit 4 times, got %d", actual)
 	}
-	if actual := atomic.LoadInt32(&deniedCount); actual != 1 {
-		t.Errorf("Expected 1 message to be denied by callback, got %d", actual)
+	if actual := atomic.LoadInt32(&deniedCount); actual != 2 {
+		t.Errorf("Expected 2 messages to be denied by callback, got %d", actual)
 	}
 	if actual := atomic.LoadInt32(&successfulCount); actual != 2 {
 		t.Errorf("Expected 2 messages to be successfully processed by callback, got %d", actual)

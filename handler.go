@@ -23,10 +23,11 @@ type ChannelMessage struct {
 
 // MessageReceivedCallback is a function type that will be called for every NATS message received
 // before it's sent to the SSE client.
-// It receives the clientID, the NATS subject, and the raw NATS message data.
+// It receives the clientID, the NATS subject, the raw NATS message data,
+// and the NATS message headers.
 // Returning an error will cause the message not to be sent to the SSE client for this specific connection,
 // and the error will be logged.
-type MessageReceivedCallback func(ctx context.Context, clientID, subject string, msgData []byte) error
+type MessageReceivedCallback func(ctx context.Context, clientID, subject string, headers nats.Header, msgData []byte) error
 
 // NATS2SSEHandler is an http.Handler for bridging NATS messages to SSE.
 type NATS2SSEHandler struct {
@@ -37,7 +38,7 @@ type NATS2SSEHandler struct {
 	Heartbeat                     time.Duration
 	Logger                        *log.Logger
 	JetStreamConsumerConfigurator func(config *jetstream.ConsumerConfig, subject string, clientID string)
-	MessageCallback               MessageReceivedCallback // Optional callback invoked for each NATS message before sending to SSE client
+	MessageCallback               MessageReceivedCallback // New field for the callback
 }
 
 func (h *NATS2SSEHandler) ensureLogger() *log.Logger {
@@ -152,11 +153,17 @@ func (h *NATS2SSEHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		consumerName := consumer.CachedInfo().Name
 
 		jsMsgHandler := func(m jetstream.Msg) {
+			// Extract NATS headers from JetStream message headers
+			natsHeaders := make(nats.Header)
+			for key := range m.Headers() {
+				natsHeaders.Set(key, m.Headers().Get(key))
+			}
+
 			cm := ChannelMessage{
 				NatsMsg: &nats.Msg{
 					Subject: m.Subject(),
 					Data:    m.Data(),
-					Header:  m.Headers(),
+					Header:  natsHeaders, // Use the extracted headers
 				},
 				JsMsg: m,
 			}
@@ -253,16 +260,14 @@ func (h *NATS2SSEHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			natsMsgToProcess := chMsg.NatsMsg
 
 			if h.MessageCallback != nil {
-				if cbErr := h.MessageCallback(ctx, clientID, natsMsgToProcess.Subject, natsMsgToProcess.Data); cbErr != nil {
+				if cbErr := h.MessageCallback(ctx, clientID, natsMsgToProcess.Subject, natsMsgToProcess.Header, natsMsgToProcess.Data); cbErr != nil {
 					logger.Printf("Client %s: Message callback for subject %s returned error: %v. Message will not be sent to SSE.", clientID, natsMsgToProcess.Subject, cbErr)
-					// If callback returns an error, we can choose to skip sending this message to SSE.
-					// We still acknowledge JetStream messages, as the error is in processing for SSE, not receipt.
 					if chMsg.JsMsg != nil {
 						if errAck := chMsg.JsMsg.Ack(); errAck != nil {
 							logger.Printf("Error Acking JetStream message for client %s on subject %s after callback failure: %v", clientID, natsMsgToProcess.Subject, errAck)
 						}
 					}
-					continue // Skip sending this message to SSE
+					continue
 				}
 			}
 
