@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
-	"github.com/nats-io/nats.go/jetstream" // Ensure this import is correct for your nats.go version
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // AuthFunc is a function type that authenticates an HTTP request
@@ -21,6 +21,13 @@ type ChannelMessage struct {
 	JsMsg   jetstream.Msg // Populated only for JetStream messages, for Ack
 }
 
+// MessageReceivedCallback is a function type that will be called for every NATS message received
+// before it's sent to the SSE client.
+// It receives the clientID, the NATS subject, and the raw NATS message data.
+// Returning an error will cause the message not to be sent to the SSE client for this specific connection,
+// and the error will be logged.
+type MessageReceivedCallback func(ctx context.Context, clientID, subject string, msgData []byte) error
+
 // NATS2SSEHandler is an http.Handler for bridging NATS messages to SSE.
 type NATS2SSEHandler struct {
 	NATSConn                      *nats.Conn
@@ -30,6 +37,7 @@ type NATS2SSEHandler struct {
 	Heartbeat                     time.Duration
 	Logger                        *log.Logger
 	JetStreamConsumerConfigurator func(config *jetstream.ConsumerConfig, subject string, clientID string)
+	MessageCallback               MessageReceivedCallback // Optional callback invoked for each NATS message before sending to SSE client
 }
 
 func (h *NATS2SSEHandler) ensureLogger() *log.Logger {
@@ -128,8 +136,6 @@ func (h *NATS2SSEHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			FilterSubject: subject,
 			AckPolicy:     jetstream.AckExplicitPolicy,
 			DeliverPolicy: jetstream.DeliverNewPolicy,
-			// Name: clientID, // Consider if clientID is suitable and unique for consumer name
-			// Durable: clientID, // If you want durable consumers based on clientID
 		}
 
 		if h.JetStreamConsumerConfigurator != nil {
@@ -143,7 +149,7 @@ func (h *NATS2SSEHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		isEphemeral := consumerConfig.Durable == ""
-		consumerName := consumer.CachedInfo().Name // Get the actual consumer name
+		consumerName := consumer.CachedInfo().Name
 
 		jsMsgHandler := func(m jetstream.Msg) {
 			cm := ChannelMessage{
@@ -162,12 +168,10 @@ func (h *NATS2SSEHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// consumeCtx is of type jetstream.ConsumeContext
 		consumeCtx, errConsume := consumer.Consume(jsMsgHandler)
 		if errConsume != nil {
 			logger.Printf("Error starting JetStream consumer %s for subject %s on stream %s for client %s: %v", consumerName, subject, streamName, clientID, errConsume)
 			if isEphemeral && consumerName != "" {
-				// Cleanup ephemeral consumer if Consume fails
 				deleteCtx, deleteCancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer deleteCancel()
 				if delErr := js.DeleteConsumer(deleteCtx, streamName, consumerName); delErr != nil {
@@ -184,7 +188,7 @@ func (h *NATS2SSEHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			js:           js,
 			streamName:   streamName,
 			consumerName: consumerName,
-			msgCtx:       consumeCtx, // Correct type: jetstream.ConsumeContext
+			msgCtx:       consumeCtx,
 			isEphemeral:  isEphemeral,
 			logger:       logger,
 			clientID:     clientID,
@@ -203,7 +207,7 @@ func (h *NATS2SSEHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		logger.Printf("Client %s subscribed to NATS subject: %s", clientID, subject)
 
 		go func() {
-			defer close(natsMsgDirectChan) // Ensure channel is closed if this goroutine exits
+			defer close(natsMsgDirectChan)
 			for {
 				select {
 				case <-ctx.Done():
@@ -233,7 +237,7 @@ func (h *NATS2SSEHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		heartbeatTicker = time.NewTicker(h.Heartbeat)
 		defer heartbeatTicker.Stop()
 	} else {
-		heartbeatTicker = &time.Ticker{C: make(<-chan time.Time)} // Dummy ticker
+		heartbeatTicker = &time.Ticker{C: make(<-chan time.Time)}
 	}
 
 	for {
@@ -247,6 +251,20 @@ func (h *NATS2SSEHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			natsMsgToProcess := chMsg.NatsMsg
+
+			if h.MessageCallback != nil {
+				if cbErr := h.MessageCallback(ctx, clientID, natsMsgToProcess.Subject, natsMsgToProcess.Data); cbErr != nil {
+					logger.Printf("Client %s: Message callback for subject %s returned error: %v. Message will not be sent to SSE.", clientID, natsMsgToProcess.Subject, cbErr)
+					// If callback returns an error, we can choose to skip sending this message to SSE.
+					// We still acknowledge JetStream messages, as the error is in processing for SSE, not receipt.
+					if chMsg.JsMsg != nil {
+						if errAck := chMsg.JsMsg.Ack(); errAck != nil {
+							logger.Printf("Error Acking JetStream message for client %s on subject %s after callback failure: %v", clientID, natsMsgToProcess.Subject, errAck)
+						}
+					}
+					continue // Skip sending this message to SSE
+				}
+			}
 
 			if chMsg.JsMsg != nil {
 				if errAck := chMsg.JsMsg.Ack(); errAck != nil {
@@ -281,11 +299,11 @@ type coreNatsSubscription struct {
 }
 
 func (s *coreNatsSubscription) Unsubscribe() error {
-	if s.sub == nil { // Already unsubscribed or never valid
+	if s.sub == nil {
 		return nil
 	}
 	err := s.sub.Unsubscribe()
-	s.sub = nil // Mark as unsubscribed
+	s.sub = nil
 	return err
 }
 func (s *coreNatsSubscription) IsValid() bool {
@@ -293,10 +311,10 @@ func (s *coreNatsSubscription) IsValid() bool {
 }
 
 type jetStreamSubscription struct {
-	js           jetstream.JetStream      // Needed to delete consumer
-	streamName   string                   // Info for deleting consumer
-	consumerName string                   // Info for deleting consumer
-	msgCtx       jetstream.ConsumeContext // For stopping the Consume() goroutine
+	js           jetstream.JetStream
+	streamName   string
+	consumerName string
+	msgCtx       jetstream.ConsumeContext
 	isEphemeral  bool
 	logger       *log.Logger
 	clientID     string
@@ -307,13 +325,12 @@ func (s *jetStreamSubscription) Unsubscribe() error {
 
 	if s.msgCtx != nil {
 		s.logger.Printf("Client %s: Stopping JetStream message context for consumer %s on stream %s", s.clientID, s.consumerName, s.streamName)
-		s.msgCtx.Stop() // Signals the Consume handler to stop
-		s.msgCtx = nil  // Mark as stopped
+		s.msgCtx.Stop()
+		s.msgCtx = nil
 	}
 
 	if s.isEphemeral && s.consumerName != "" && s.js != nil {
 		s.logger.Printf("Client %s: Deleting ephemeral JetStream consumer %s on stream %s", s.clientID, s.consumerName, s.streamName)
-		// Use a background context with timeout for deletion, as original request context might be done.
 		deleteCtx, deleteCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer deleteCancel()
 		err := s.js.DeleteConsumer(deleteCtx, s.streamName, s.consumerName)
@@ -327,8 +344,6 @@ func (s *jetStreamSubscription) Unsubscribe() error {
 				}
 			}
 		}
-		// s.consumerName = "" // Mark as deleted to prevent re-deletion if IsValid logic changes
-		// s.js = nil // Don't nil js, it's a reference
 	} else if s.isEphemeral {
 		s.logger.Printf("Client %s: Cannot delete ephemeral JetStream consumer. Name: '%s', JS available: %t", s.clientID, s.consumerName, s.js != nil)
 	}
@@ -337,8 +352,5 @@ func (s *jetStreamSubscription) Unsubscribe() error {
 }
 
 func (s *jetStreamSubscription) IsValid() bool {
-	// A subscription is valid if its message context can be stopped,
-	// or if it's an ephemeral consumer that might still need deletion.
-	// Once msgCtx is nil and (if ephemeral) deletion has been attempted, it's no longer "valid" for Unsubscribe.
 	return s.msgCtx != nil || (s.isEphemeral && s.consumerName != "" && s.js != nil)
 }

@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -133,7 +134,7 @@ func TestNATS2SSEHandler_CoreNATS_Embedded(t *testing.T) {
 		}
 		_, _ = reader.ReadString('\n') // Read the second newline
 
-		for i := 0; i < 3; i++ { // Expect 1 event line, 1 data line, 1 empty line
+		for i := range 3 { // Expect 1 event line, 1 data line, 1 empty line
 			line, readErr := reader.ReadString('\n')
 			if readErr != nil {
 				if errors.Is(readErr, io.EOF) && i > 0 {
@@ -267,7 +268,7 @@ func TestNATS2SSEHandler_JetStream_Embedded(t *testing.T) {
 		}
 		_, _ = reader.ReadString('\n')
 
-		for i := 0; i < 3; i++ {
+		for i := range 3 {
 			line, readErr := reader.ReadString('\n')
 			if readErr != nil {
 				if errors.Is(readErr, io.EOF) && i > 0 {
@@ -336,5 +337,181 @@ func TestNATS2SSEHandler_JetStream_Embedded(t *testing.T) {
 	}
 	if !foundData {
 		t.Errorf("SSE JS data line with correct payload not found. Received: %v", receivedMessages)
+	}
+}
+
+func TestNATS2SSEHandler_MessageCallback(t *testing.T) {
+	nc, _, cleanup := setupTestServer(t, false)
+	defer cleanup()
+
+	var callbackHitCount int32
+	var deniedCount int32
+	var successfulCount int32
+	denyMessageContent := "DENY THIS MESSAGE"
+	allowMessageContent := "ALLOW THIS MESSAGE"
+
+	callback := func(ctx context.Context, clientID, subject string, msgData []byte) error {
+		atomic.AddInt32(&callbackHitCount, 1)
+		t.Logf("Callback invoked for client %s, subject %s, data: %s", clientID, subject, string(msgData))
+		if strings.Contains(string(msgData), denyMessageContent) {
+			atomic.AddInt32(&deniedCount, 1)
+			return errors.New("denied by test callback")
+		}
+		atomic.AddInt32(&successfulCount, 1)
+		return nil
+	}
+
+	handler := &NATS2SSEHandler{
+		NATSConn:        nc,
+		Auth:            testAuthFunc,
+		Logger:          log.New(io.Discard, "", 0),
+		MessageCallback: callback,
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(handler.ServeHTTP))
+	defer server.Close()
+
+	sseURL := fmt.Sprintf("%s?token=%s&subject=%s", server.URL, testToken, testSubjectCore)
+	req, _ := http.NewRequest("GET", sseURL, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req = req.WithContext(ctx)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("SSE request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("Expected status OK, got %d. Body: %s", resp.StatusCode, string(body))
+	}
+
+	reader := bufio.NewReader(resp.Body)
+	receivedSSEData := make(chan string, 5) // Channel to send decoded SSE data
+	var sseReaderWG sync.WaitGroup
+	sseReaderWG.Add(1)
+
+	go func() {
+		defer sseReaderWG.Done()
+		defer close(receivedSSEData)
+		// Consume initial comments
+		for {
+			line, readErr := reader.ReadString('\n')
+			if readErr != nil {
+				t.Logf("SSE reader initial read error (expected if context done): %v", readErr)
+				return
+			}
+			if strings.TrimSpace(line) == "" {
+				break // Found the empty line after comments
+			}
+		}
+
+		// Read actual events
+		for {
+			select {
+			case <-ctx.Done():
+				t.Log("SSE reader context done.")
+				return
+			default:
+				line, readErr := reader.ReadString('\n')
+				if readErr != nil {
+					if errors.Is(readErr, io.EOF) || errors.Is(readErr, context.Canceled) {
+						t.Logf("SSE reader stream closed or context cancelled: %v", readErr)
+						return
+					}
+					t.Errorf("Error reading SSE stream: %v", readErr)
+					return
+				}
+				trimmedLine := strings.TrimSpace(line)
+				if strings.HasPrefix(trimmedLine, "data:") {
+					encodedData := strings.TrimSpace(strings.TrimPrefix(trimmedLine, "data:"))
+					decodedData, decErr := base64.StdEncoding.DecodeString(encodedData)
+					if decErr != nil {
+						t.Errorf("Failed to decode base64 data '%s': %v", encodedData, decErr)
+						continue
+					}
+					receivedSSEData <- string(decodedData)
+				}
+			}
+		}
+	}()
+
+	// Give the SSE connection and reader a moment
+	time.Sleep(200 * time.Millisecond)
+
+	// Publish message that should be allowed
+	if pubErr := nc.Publish(testSubjectCore, []byte(allowMessageContent)); pubErr != nil {
+		t.Fatalf("Failed to publish ALLOW message: %v", pubErr)
+	}
+	t.Logf("Published ALLOW message: %s", allowMessageContent)
+
+	// Publish message that should be denied by the callback
+	if pubErr := nc.Publish(testSubjectCore, []byte(denyMessageContent)); pubErr != nil {
+		t.Fatalf("Failed to publish DENY message: %v", pubErr)
+	}
+	t.Logf("Published DENY message: %s", denyMessageContent)
+
+	// Publish another allowed message
+	if pubErr := nc.Publish(testSubjectCore, []byte(allowMessageContent+" 2")); pubErr != nil {
+		t.Fatalf("Failed to publish ALLOW message 2: %v", pubErr)
+	}
+	t.Logf("Published ALLOW message 2: %s", allowMessageContent+" 2")
+
+	// Collect received SSE messages with a timeout
+	var receivedPayloads []string
+	expectedPayloads := []string{allowMessageContent, allowMessageContent + " 2"}
+	collectTimeout := time.After(2 * time.Second)
+
+	for len(receivedPayloads) < len(expectedPayloads) {
+		select {
+		case payload := <-receivedSSEData:
+			receivedPayloads = append(receivedPayloads, payload)
+		case <-collectTimeout:
+			t.Logf("Timeout waiting for all expected SSE messages. Got %d, expected %d.", len(receivedPayloads), len(expectedPayloads))
+			break
+		case <-ctx.Done():
+			t.Log("Test context cancelled during SSE payload collection.")
+			break
+		}
+	}
+
+	// Wait a bit more to ensure no unexpected messages arrive (like the denied one)
+	select {
+	case unexpected := <-receivedSSEData:
+		t.Fatalf("Received unexpected SSE message after collection: %s", unexpected)
+	case <-time.After(500 * time.Millisecond):
+		// No unexpected messages within the grace period, good.
+	case <-ctx.Done():
+	}
+
+	cancel()           // Signal http request to finish
+	sseReaderWG.Wait() // Wait for the SSE reader goroutine to finish
+
+	// Assertions
+	if actual := atomic.LoadInt32(&callbackHitCount); actual != 3 {
+		t.Errorf("Expected callback to be hit 3 times, got %d", actual)
+	}
+	if actual := atomic.LoadInt32(&deniedCount); actual != 1 {
+		t.Errorf("Expected 1 message to be denied by callback, got %d", actual)
+	}
+	if actual := atomic.LoadInt32(&successfulCount); actual != 2 {
+		t.Errorf("Expected 2 messages to be successfully processed by callback, got %d", actual)
+	}
+
+	if len(receivedPayloads) != 2 {
+		t.Fatalf("Expected 2 SSE messages to be sent, got %d. Received: %v", len(receivedPayloads), receivedPayloads)
+	}
+	if !((receivedPayloads[0] == allowMessageContent && receivedPayloads[1] == allowMessageContent+" 2") ||
+		(receivedPayloads[1] == allowMessageContent && receivedPayloads[0] == allowMessageContent+" 2")) {
+		t.Errorf("Received payloads mismatch. Expected %v, got %v", expectedPayloads, receivedPayloads)
+	}
+
+	// Verify the denied message was NOT received by SSE
+	for _, payload := range receivedPayloads {
+		if strings.Contains(payload, denyMessageContent) {
+			t.Errorf("Denied message '%s' was unexpectedly sent to SSE!", denyMessageContent)
+		}
 	}
 }

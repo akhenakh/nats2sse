@@ -16,39 +16,33 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
+	"embed"
+
 	"github.com/akhenakh/nats2sse"
 )
 
+//go:embed static/index.html
+var indexHTML embed.FS
+
 // SimpleAuth is a basic authentication function.
 // In a real app, you'd inspect r.Header.Get("Authorization") for a JWT, etc.
-// It expects a query parameter "token" which dictates the subject.
-// Example: /events?token=user123.updates -> subscribes to "user123.updates"
-// Example: /events?token=jwt_token_here (decode JWT to get subject)
+// It expects a query parameter "subject" which dictates the subject.
+// Example: /events?subject=user123.updates -> subscribes to "user123.updates"
+// Example: /events?subject=jwt_token_here (decode JWT to get subject)
 func SimpleAuth(r *http.Request) (subject string, clientID string, err error) {
-	token := r.URL.Query().Get("token")
-	if token == "" {
-		return "", "", errors.New("missing token parameter")
+	subjectParam := r.URL.Query().Get("subject")
+	if subjectParam == "" {
+		return "", "", errors.New("missing subject parameter")
 	}
 
 	// This is a placeholder. A real app would validate the token (e.g., JWT)
 	// and derive the subject and clientID from it.
-	// For this example, we'll use the token itself as the subject,
-	// and a prefix of the token as clientID.
+	// For this example, we'll use the subject itself as both the subject and clientID.
 	// Ensure the subject is safe and doesn't allow arbitrary subscriptions.
-	// e.g. if token = "user123.data", subject = "user123.data"
-	// e.g. if token = "jwt...", decode jwt, get userID, subject = "users." + userID + ".events"
+	// e.g. if subject = "user123.data", subject = "user123.data"
+	// e.g. if subject = "jwt...", decode jwt, get userID, subject = "users." + userID + ".events"
 
-	if !isValidSubject(token) { // Basic validation
-		return "", token, errors.New("invalid subject format in token")
-	}
-
-	// Use part of the token or a request ID as clientID for logging
-	cid := r.Header.Get("X-Request-ID")
-	if cid == "" {
-		cid = "client_" + strings.Split(token, ".")[0] // Simplistic client ID
-	}
-
-	return token, cid, nil
+	return subjectParam, subjectParam, nil
 }
 
 // isValidSubject is a very basic validation.
@@ -69,11 +63,12 @@ func main() {
 	streamName := flag.String("stream", "MY_EVENTS", "JetStream stream name (if using JetStream)")
 	streamSubjects := flag.String("subjects", "events.>", "JetStream stream subjects (e.g., 'events.>')")
 	httpAddr := flag.String("http_addr", ":8080", "HTTP listen address")
+
 	flag.Parse()
 
 	logger := log.New(os.Stdout, "NATS2SSE_APP: ", log.LstdFlags|log.Lmicroseconds)
 
-	// --- Connect to NATS ---
+	// Connect to NATS
 	nc, err := nats.Connect(*natsURL,
 		nats.Name("NATS2SSE Bridge"),
 		nats.ReconnectWait(2*time.Second),
@@ -94,6 +89,7 @@ func main() {
 	defer nc.Drain()
 	logger.Printf("Connected to NATS server: %s", nc.ConnectedUrl())
 
+	logger.Println(*useJetStream)
 	// Setup JetStream Stream if enabled (optional, for testing)
 	if *useJetStream {
 		js, err := jetstream.New(nc)
@@ -122,7 +118,7 @@ func main() {
 
 		// Example publisher for JetStream
 		go func() {
-			ticker := time.NewTicker(5 * time.Second)
+			ticker := time.NewTicker(1 * time.Second)
 			defer ticker.Stop()
 			i := 0
 			for range ticker.C {
@@ -178,12 +174,8 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/events", natsSSEHandler) // All requests to /events go to our handler
 
-	// Simple root handler
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintln(w, "NATS to SSE Bridge. Use /events?token=<subject_to_subscribe>")
-		fmt.Fprintln(w, "Example (Core NATS): /events?token=public.messages")
-		fmt.Fprintln(w, "Example (JetStream, if stream 'MY_EVENTS' has 'events.>'): /events?token=events.typeA.123")
-	})
+	// Serve static files
+	mux.Handle("/", http.FileServer(http.FS(indexHTML)))
 
 	// Start HTTP Server
 	server := &http.Server{
