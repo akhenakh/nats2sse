@@ -1,22 +1,20 @@
 # NATS to SSE Bridge (nats2sse)
 
-A Go library providing an `http.Handler` to bridge messages from NATS (including JetStream) to Server-Sent Events (SSE) clients.
-
+A Go library providing an `http.Handler` to bridge messages from NATS JetStream to Server-Sent Events (SSE) clients.
 
 ## Status
 
-This was generated 99% using Gemini, it is useful to me use it at your own risk ;)
-
+This was generated 90% using Gemini, it is useful to me use it at your own risk ;)
 
 ## Features
 
-*   Supports NATS Core subscriptions.
-*   Supports NATS JetStream subscriptions (ephemeral or durable consumers).
-*   Customizable authentication via `AuthFunc`.
-*   Configurable SSE heartbeats for keep-alive.
-*   Optional logger.
-*   JetStream consumer configuration can be customized.
-*   Callbacks for message processing and error handling.
+*   **NATS JetStream Native**: Built exclusively for NATS JetStream, supporting ephemeral or durable consumers.
+*   **Historical Message Replay**: Clients can request messages from a specific point in time using a `since` timestamp parameter.
+*   **Customizable Authentication**: Secure your endpoint and determine subject subscriptions per request via a flexible `AuthFunc`.
+*   **On-the-fly Message Transformation**: A powerful callback function allows you to inspect, modify, filter, or reject any message before it's sent to the client.
+*   **Configurable SSE Heartbeats**: Keep connections alive through proxies and firewalls.
+*   **Flexible Consumer Configuration**: Fine-tune the underlying JetStream consumer (e.g., for durable consumers, replay policies, rate limits).
+*   **Custom Logging**: Integrates with your existing logging setup.
 
 ## Installation
 
@@ -30,31 +28,44 @@ There is an example server in `cmd/server`.
 
 ### 1. Define an Authentication Function
 
-The `AuthFunc` is responsible for authenticating the HTTP request and determining which NATS subject(s) the client should subscribe to. It can also return a `clientID` for logging or creating durable JetStream consumers.
+The `AuthFunc` is responsible for authenticating the HTTP request, determining which NATS subject the client should subscribe to, and optionally parsing a `since` parameter for historical message replay.
 
 ```go
 import (
-	"net/http"
 	"errors"
+	"fmt"
+	"net/http"
+	"time"
 )
 
-// SimpleAuth allows any client to subscribe to a subject provided in a query parameter.
-// In a real application, you'd implement proper token validation, ACL checks, JWT validation, etc.
-func SimpleAuth(r *http.Request) (subject string, clientID string, err error) {
+// SimpleAuth demonstrates token auth, subject/clientID extraction, and parsing the 'since' parameter.
+// In a real application, you'd implement proper token validation, ACL checks, etc.
+func SimpleAuth(r *http.Request) (subject string, clientID string, since *time.Time, err error) {
 	token := r.URL.Query().Get("token")
 	subj := r.URL.Query().Get("subject")
-	cID := r.URL.Query().Get("clientID") // Optional client ID
+	cID := r.URL.Query().Get("clientID") // Optional client ID for durable consumers
+	sinceStr := r.URL.Query().Get("since")
 
-	if token != "supersecret" { // Replace with real auth logic
-		return "", "", errors.New("invalid token")
+	if token != "supersecret" { // Replace with real auth logic, or relly on existing solution like JWT
+		return "", "", nil, errors.New("invalid token")
 	}
 	if subj == "" {
-		return "", "", errors.New("subject parameter is required")
+		return "", "", nil, errors.New("subject parameter is required")
 	}
 	if cID == "" {
-		cID = "anonymous-" + subj // Or generate a unique one
+		cID = "anonymous-" + subj // Or generate a unique one for ephemeral consumers
 	}
-	return subj, cID, nil
+
+	// Handle optional 'since' parameter for historical messages
+	if sinceStr != "" {
+		t, errParse := time.Parse(time.RFC3339, sinceStr)
+		if errParse != nil {
+			return "", "", nil, fmt.Errorf("invalid 'since' parameter format (requires RFC3339): %w", errParse)
+		}
+		since = &t
+	}
+
+	return subj, cID, since, nil
 }
 ```
 
@@ -64,80 +75,82 @@ func SimpleAuth(r *http.Request) (subject string, clientID string, err error) {
 package main
 
 import (
+	"context"
+	"errors"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
-	"github.com/nats-io/nats.go"
-	"github.com/nats-io/nats.go/jetstream" // If using JetStream
 	"github.com/akhenakh/nats2sse"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
-// Example SimpleAuth (from above)
-func SimpleAuth(r *http.Request) (subject string, clientID string, err error) {
-	// ... (implementation from above)
-	token := r.URL.Query().Get("token")
-	subj := r.URL.Query().Get("subject")
-	cID := r.URL.Query().Get("clientID")
-
-	if token != "supersecret" {
-		return "", "", errors.New("invalid token")
-	}
-	if subj == "" {
-		return "", "", errors.New("subject parameter is required")
-	}
-	if cID == "" {
-		cID = "anonymous-" + subj
-	}
-	return subj, cID, nil
-}
-
+// SimpleAuth implementation from above...
 
 func main() {
-	// Connect to NATS
+	// 1. Connect to NATS
 	nc, err := nats.Connect(nats.DefaultURL)
 	if err != nil {
 		log.Fatalf("Error connecting to NATS: %v", err)
 	}
 	defer nc.Close()
 
-	// --- For JetStream (Optional) ---
-	// js, err := jetstream.New(nc)
-	// if err != nil {
-	// 	log.Fatalf("Error creating JetStream context: %v", err)
-	// }
-	// // Ensure stream exists
-	// streamCfg := jetstream.StreamConfig{
-	// 	Name:     "mystream",
-	// 	Subjects: []string{"events.>"},
-	// }
-	// _, err = js.CreateOrUpdateStream(context.Background(), streamCfg)
-	// if err != nil {
-	// 	log.Fatalf("Error creating/updating stream: %v", err)
-	// }
-	// ---------------------------------
+	// 2. Get JetStream context and ensure your stream exists
+	js, err := jetstream.New(nc)
+	if err != nil {
+		log.Fatalf("Error creating JetStream context: %v", err)
+	}
+	streamCfg := jetstream.StreamConfig{
+		Name:     "mystream",
+		Subjects: []string{"events.>"},
+	}
+	_, err = js.CreateOrUpdateStream(context.Background(), streamCfg)
+	if err != nil {
+		log.Fatalf("Error creating/updating stream: %v", err)
+	}
 
-	// Create the NATS2SSE handler
+	// 3. Create the NATS2SSE handler
 	sseHandler := &nats2sse.NATS2SSEHandler{
-		NATSConn: nc,
-		Auth:     SimpleAuth,
-		// IsJetStream:   true,          // Set to true if using JetStream
-		// JetStreamName: "mystream",    // Required if IsJetStream is true and stream name isn't discovered by subject
-		Heartbeat: 30 * time.Second,
-		Logger:    log.Default(),
-		// JetStreamConsumerConfigurator: func(config *jetstream.ConsumerConfig, subject string, clientID string) {
-		// 	// Example: Make consumer durable if clientID is provided
-		// 	if clientID != "" && strings.HasPrefix(clientID, "durable-") {
-		// 		config.Durable = clientID
-		// 		config.DeliverPolicy = jetstream.DeliverAllPolicy // For durables, often want all messages
-		//      config.Name = clientID // Explicitly set consumer name
-		// 	}
-		// },
+		NATSConn:      nc,
+		Auth:          SimpleAuth,
+		JetStreamName: "mystream", // Specify the stream name
+		Heartbeat:     30 * time.Second,
+		Logger:        log.Default(),
+		JetStreamConsumerConfigurator: func(config *jetstream.ConsumerConfig, subject string, clientID string) {
+			// Example: Make consumer durable if clientID is provided
+			if clientID != "" && strings.HasPrefix(clientID, "durable-") {
+				config.Durable = clientID
+				// For durables, you might want to resume from where they left off
+				config.DeliverPolicy = jetstream.DeliverLastPolicy
+				config.Name = clientID
+			}
+		},
+		MessageCallback: func(ctx context.Context, clientID, subject string, headers nats.Header, msgData []byte) ([]byte, error) {
+			// Example: Add a prefix to every message payload
+			log.Printf("Callback received message for client %s on subject %s", clientID, subject)
+
+			// To filter out a message, return (nil, nil)
+			if string(msgData) == "skip" {
+				return nil, nil
+			}
+
+			// To signal an error and drop the message, return (nil, error)
+			if string(msgData) == "error" {
+				return nil, errors.New("encountered an error message")
+			}
+
+			// To modify the message, return the new payload
+			newData := []byte("processed: " + string(msgData))
+			return newData, nil
+		},
 	}
 
 	http.Handle("/events", sseHandler)
 	log.Println("SSE server listening on :8080/events")
-	log.Println("Try: curl -N 'http://localhost:8080/events?token=supersecret&subject=foo.bar'")
+	log.Println("Try: curl -N 'http://localhost:8080/events?token=supersecret&subject=events.foo'")
+	log.Println("Or with history: curl -N 'http://localhost:8080/events?token=supersecret&subject=events.foo&since=2023-01-01T00:00:00Z'")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatalf("HTTP server error: %v", err)
 	}
@@ -157,9 +170,12 @@ func main() {
     <ul id="messages"></ul>
 
     <script>
-        const subject = "foo.bar"; // Or get from user input
+        const subject = "events.foo"; // The NATS subject to listen to
         const token = "supersecret";
-        const clientID = "web-client-123"; // Optional
+        const clientID = "web-client-123"; // Optional, for durable consumers
+
+        // Optional: Get all messages since a specific time
+        const sinceTimestamp = "2023-10-26T10:00:00Z"; // RFC3339 format
 
         // Construct the URL, ensuring parameters are URL-encoded
         const params = new URLSearchParams();
@@ -167,6 +183,9 @@ func main() {
         params.append("subject", subject);
         if (clientID) {
             params.append("clientID", clientID);
+        }
+        if (sinceTimestamp) {
+            params.append("since", sinceTimestamp);
         }
 
         const eventSourceUrl = `/events?${params.toString()}`;
@@ -180,27 +199,16 @@ func main() {
             document.getElementById("messages").appendChild(li);
         };
 
-        // Generic message handler (if specific event names are not used often from NATS subjects)
-        // eventSource.onmessage = function(event) {
-        //     const li = document.createElement("li");
-        //     // Data is base64 encoded by the server
-        //     const decodedData = atob(event.data);
-        //     li.textContent = `Event: ${event.type}, ID: ${event.id || 'N/A'}, Data: ${decodedData}`;
-        //     document.getElementById("messages").appendChild(li);
-        //     console.log("Generic message:", event);
-        // };
-
-        // Listen for specific events (NATS subjects)
-        // Replace "foo.bar" with the actual subject you are subscribing to
+        // Listen for events whose type matches the NATS subject
         eventSource.addEventListener(subject, function(event) {
             const li = document.createElement("li");
             // Data is base64 encoded by the server
             try {
                 const decodedData = atob(event.data); // Assuming data was base64 encoded
-                li.textContent = `Event Type (Subject): ${event.type}, ID: ${event.id || 'N/A'}, Data: ${decodedData}`;
+                li.textContent = `Event (Subject: ${event.type}): ${decodedData}`;
                 console.log("Specific event:", event.type, "Data:", decodedData);
             } catch (e) {
-                li.textContent = `Event Type (Subject): ${event.type}, ID: ${event.id || 'N/A'}, Raw Data: ${event.data} (Error decoding: ${e})`;
+                li.textContent = `Event (Subject: ${event.type}), Raw Data: ${event.data} (Error decoding: ${e})`;
                 console.error("Error decoding base64 data:", e, "Raw data:", event.data);
             }
             document.getElementById("messages").appendChild(li);
@@ -212,26 +220,27 @@ func main() {
             li.textContent = "SSE Connection error. See console.";
             li.style.color = "red";
             document.getElementById("messages").appendChild(li);
-            eventSource.close(); // Close on error to prevent constant retries from browser if server is down
+            eventSource.close(); // Close on error to prevent constant retries from browser
         };
-
-        // Optional: Handle comments (keep-alives)
-        eventSource.addEventListener('comment', function(event) {
-            console.log("Received comment:", event.data);
-        });
     </script>
 </body>
 </html>
 ```
 
-## JetStream Considerations
+## Handler Configuration Details
 
-*   If `IsJetStream` is `true`:
-    *   The `JetStreamName` field should specify the name of the JetStream stream to bind to. If left empty, the handler will attempt to discover the stream name using `js.StreamNameBySubject()`.
-    *   By default, an ephemeral JetStream consumer is created with `AckExplicit` and `DeliverNew` policies.
-    *   You can customize the `jetstream.ConsumerConfig` using the `JetStreamConsumerConfigurator` function. This is useful for creating durable consumers, setting different deliver policies, rate limits, etc.
-    *   Make sure the stream and its subjects are correctly configured in your NATS server.
-    *   Ephemeral consumers are automatically deleted when the SSE client disconnects. Durable consumers persist.
+*   The handler operates exclusively with NATS JetStream. You must have a JetStream-enabled NATS server.
+*   `JetStreamName`: This field should specify the name of the JetStream stream. If left empty, the handler will attempt to discover the stream name based on the subject provided during authentication.
+*   **Consumers**:
+    *   By default, an **ephemeral** JetStream consumer is created for each connection with `AckExplicit` and `DeliverNew` policies. These consumers are automatically deleted when the client disconnects.
+    *   You can create **durable** consumers by providing a `clientID` in the `AuthFunc` and using the `JetStreamConsumerConfigurator` to set the `Durable` field in the consumer config.
+*   **Historical Replay (`since` parameter)**:
+    *   When a client provides a valid `since` timestamp (in RFC3339 format), the handler automatically configures the underlying JetStream consumer with `DeliverPolicy: DeliverByStartTimePolicy`.
+    *   This instructs JetStream to send all messages stored in the stream that are newer than the specified time, before switching to live messages. This is a powerful feature for clients that need to catch up on missed events.
+*   `MessageCallback`: This function is called for every message *before* it is sent to the client.
+    *   Return `(data, nil)` to send the (potentially modified) data.
+    *   Return `(nil, nil)` to silently filter/drop the message.
+    *   Return `(nil, error)` to drop the message and log the error.
 
 ## Error Handling
 
