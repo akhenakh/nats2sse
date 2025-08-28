@@ -41,6 +41,69 @@ type NATS2SSEHandler struct {
 	messageCallback               MessageReceivedCallback
 }
 
+// HandlerOption is a function type for configuring NATS2SSEHandler
+type HandlerOption func(*NATS2SSEHandler)
+
+// WithNATSConnection sets the NATS connection
+func WithNATSConnection(conn *nats.Conn) HandlerOption {
+	return func(h *NATS2SSEHandler) {
+		h.natsConn = conn
+	}
+}
+
+// WithSubjectFunc sets the subject function
+func WithSubjectFunc(fn SubjectFunc) HandlerOption {
+	return func(h *NATS2SSEHandler) {
+		h.subjectFunc = fn
+	}
+}
+
+// WithJetStreamName sets the JetStream name
+func WithJetStreamName(name string) HandlerOption {
+	return func(h *NATS2SSEHandler) {
+		h.jetStreamName = name
+	}
+}
+
+// WithHeartbeat sets the heartbeat duration
+func WithHeartbeat(duration time.Duration) HandlerOption {
+	return func(h *NATS2SSEHandler) {
+		h.heartbeat = duration
+	}
+}
+
+// WithLogger sets the logger
+func WithLogger(logger *log.Logger) HandlerOption {
+	return func(h *NATS2SSEHandler) {
+		h.logger = logger
+	}
+}
+
+// WithJetStreamConsumerConfigurator sets the JetStream consumer configurator
+func WithJetStreamConsumerConfigurator(configurator func(config *jetstream.ConsumerConfig, subject string, clientID string)) HandlerOption {
+	return func(h *NATS2SSEHandler) {
+		h.jetStreamConsumerConfigurator = configurator
+	}
+}
+
+// WithMessageCallback sets the message callback
+func WithMessageCallback(callback MessageReceivedCallback) HandlerOption {
+	return func(h *NATS2SSEHandler) {
+		h.messageCallback = callback
+	}
+}
+
+// NewNATS2SSEHandler creates a new NATS2SSEHandler with the given options
+func NewNATS2SSEHandler(options ...HandlerOption) *NATS2SSEHandler {
+	handler := &NATS2SSEHandler{}
+
+	for _, option := range options {
+		option(handler)
+	}
+
+	return handler
+}
+
 func (h *NATS2SSEHandler) ensureLogger() *log.Logger {
 	if h.logger == nil {
 		return log.Default()
