@@ -21,7 +21,6 @@ This was generated 90% using Gemini, it is useful to me use it at your own risk 
 ```bash
 go get github.com/akhenakh/nats2sse
 ```
-
 ## Usage
 
 There is an example server in `cmd/server`.
@@ -35,6 +34,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -58,10 +58,11 @@ func SimpleAuth(r *http.Request) (subject string, clientID string, since *time.T
 
 	// Handle optional 'since' parameter for historical messages
 	if sinceStr != "" {
-		t, errParse := time.Parse(time.RFC3339, sinceStr)
+		epoch, errParse := strconv.ParseInt(sinceStr, 10, 64)
 		if errParse != nil {
-			return "", "", nil, fmt.Errorf("invalid 'since' parameter format (requires RFC3339): %w", errParse)
+			return "", "", nil, fmt.Errorf("invalid 'since' parameter format (requires Unix epoch seconds): %w", errParse)
 		}
+		t := time.Unix(epoch, 0)
 		since = &t
 	}
 
@@ -150,7 +151,7 @@ func main() {
 	http.Handle("/events", sseHandler)
 	log.Println("SSE server listening on :8080/events")
 	log.Println("Try: curl -N 'http://localhost:8080/events?token=supersecret&subject=events.foo'")
-	log.Println("Or with history: curl -N 'http://localhost:8080/events?token=supersecret&subject=events.foo&since=2023-01-01T00:00:00Z'")
+	log.Println("Or with history: curl -N 'http://localhost:8080/events?token=supersecret&subject=events.foo&since=1672531200'")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatalf("HTTP server error: %v", err)
 	}
@@ -175,7 +176,7 @@ func main() {
         const clientID = "web-client-123"; // Optional, for durable consumers
 
         // Optional: Get all messages since a specific time
-        const sinceTimestamp = "2023-10-26T10:00:00Z"; // RFC3339 format
+        const sinceTimestamp = "1698295200"; // Unix epoch in seconds (e.g., for 2023-10-26T10:00:00Z)
 
         // Construct the URL, ensuring parameters are URL-encoded
         const params = new URLSearchParams();
@@ -235,7 +236,7 @@ func main() {
     *   By default, an **ephemeral** JetStream consumer is created for each connection with `AckExplicit` and `DeliverNew` policies. These consumers are automatically deleted when the client disconnects.
     *   You can create **durable** consumers by providing a `clientID` in the `AuthFunc` and using the `JetStreamConsumerConfigurator` to set the `Durable` field in the consumer config.
 *   **Historical Replay (`since` parameter)**:
-    *   When a client provides a valid `since` timestamp (in RFC3339 format), the handler automatically configures the underlying JetStream consumer with `DeliverPolicy: DeliverByStartTimePolicy`.
+    *   When a client provides a valid `since` timestamp (as a string representing seconds since the Unix epoch), the handler automatically configures the underlying JetStream consumer with `DeliverPolicy: DeliverByStartTimePolicy`.
     *   This instructs JetStream to send all messages stored in the stream that are newer than the specified time, before switching to live messages. This is a powerful feature for clients that need to catch up on missed events.
 *   `MessageCallback`: This function is called for every message *before* it is sent to the client.
     *   Return `(data, nil)` to send the (potentially modified) data.

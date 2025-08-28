@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -131,14 +132,95 @@ func testSubjectFunc(r *http.Request) (subject string, clientID string, since *t
 		return "", "", nil, errors.New("subject parameter required for test")
 	}
 	if sinceStr != "" {
-		t, errParse := time.Parse(time.RFC3339, sinceStr)
+		epoch, errParse := strconv.ParseInt(sinceStr, 10, 64)
 		if errParse != nil {
-			return "", "", nil, fmt.Errorf("invalid since parameter format: %w", errParse)
+			return "", "", nil, fmt.Errorf("invalid since parameter format (expected Unix epoch seconds): %w", errParse)
 		}
+		t := time.Unix(epoch, 0)
 		since = &t
 	}
 	return subj, testClientID, since, nil
 }
+
+// func TestNATS2SSEHandler_JetStream_SinceFilter2(t *testing.T) {
+// 	nc, js, cleanup := setupJetStreamServer(t)
+// 	defer cleanup()
+// 	createTestStream(t, js, testStreamName, testSubjectJetStream)
+
+// 	pubCtx, pubCancel := context.WithTimeout(context.Background(), 5*time.Second) // Increased timeout for publishing
+// 	defer pubCancel()
+
+// 	// 1. Publish the "old message" well before we establish sinceTime
+// 	// Use a loop to ensure it's written to the stream and acknowledged
+// 	_, err := js.Publish(pubCtx, testSubjectJetStream, []byte("old message 1"))
+// 	if err != nil {
+// 		t.Fatalf("Failed to publish old message 1: %v", err)
+// 	}
+// 	time.Sleep(50 * time.Millisecond) // Give NATS a moment to persist
+// 	_, err = js.Publish(pubCtx, testSubjectJetStream, []byte("old message 2"))
+// 	if err != nil {
+// 		t.Fatalf("Failed to publish old message 2: %v", err)
+// 	}
+// 	time.Sleep(50 * time.Millisecond) // Give NATS a moment to persist
+
+// 	// 2. Establish the 'sinceTime' after the old messages have been published and processed.
+// 	// We want messages *strictly* after this point.
+// 	sinceTime := time.Now().Add(50 * time.Millisecond) // Add a small buffer to ensure messages published *after* this time
+// 	time.Sleep(100 * time.Millisecond)                 // Ensure actual time passes after setting sinceTime
+
+// 	// 3. Publish the "new message" clearly after the sinceTime
+// 	expectedPayload := "new message"
+// 	_, err = js.Publish(pubCtx, testSubjectJetStream, []byte(expectedPayload))
+// 	if err != nil {
+// 		t.Fatalf("Failed to publish new message: %v", err)
+// 	}
+// 	time.Sleep(50 * time.Millisecond) // Give NATS a moment to persist
+
+// 	handler := &NATS2SSEHandler{
+// 		natsConn:      nc,
+// 		subjectFunc:   testSubjectFunc,
+// 		jetStreamName: testStreamName,
+// 		logger:        log.New(io.Discard, "", 0),
+// 	}
+
+// 	server := httptest.NewServer(http.HandlerFunc(handler.ServeHTTP))
+// 	defer server.Close()
+
+// 	// Format sinceTime directly for the URL parameter
+// 	sinceParam := fmt.Sprintf("%d", sinceTime.Unix()) // Use Unix epoch seconds
+// 	sseURL := fmt.Sprintf("%s?token=%s&subject=%s&since=%s", server.URL, testToken, testSubjectJetStream, sinceParam)
+// 	req, _ := http.NewRequest("GET", sseURL, nil)
+// 	ctx, cancelHTTP := context.WithTimeout(context.Background(), 5*time.Second)
+// 	defer cancelHTTP()
+// 	req = req.WithContext(ctx)
+
+// 	resp, err := http.DefaultClient.Do(req)
+// 	if err != nil {
+// 		t.Fatalf("SSE request failed: %v", err)
+// 	}
+// 	defer resp.Body.Close()
+
+// 	if resp.StatusCode != http.StatusOK {
+// 		body, _ := io.ReadAll(resp.Body)
+// 		t.Fatalf("Expected status OK, got %d. Body: %s", resp.StatusCode, string(body))
+// 	}
+
+// 	// Read responses until the context is done.
+// 	// Add a slight delay before cancelling context to allow messages to propagate.
+// 	readCtx, readCancel := context.WithTimeout(context.Background(), 2*time.Second)
+// 	defer readCancel()
+
+// 	// Use the enhanced readAllSSEResponses to get all payloads
+// 	receivedPayloads := readAllSSEResponses(t, readCtx, resp.Body)
+
+// 	if len(receivedPayloads) != 1 {
+// 		t.Fatalf("Expected to receive 1 message, but got %d. Payloads: %v", len(receivedPayloads), receivedPayloads)
+// 	}
+
+// 	if receivedPayloads[0] != expectedPayload {
+// 		t.Errorf("Expected payload '%s', got '%s'", expectedPayload, receivedPayloads[0])
+// 	}
+// }
 
 func TestNATS2SSEHandler_JetStream_Embedded(t *testing.T) {
 	nc, js, cleanup := setupJetStreamServer(t)
@@ -233,25 +315,35 @@ func TestNATS2SSEHandler_JetStream_SinceFilter(t *testing.T) {
 	defer cleanup()
 	createTestStream(t, js, testStreamName, testSubjectJetStream)
 
-	pubCtx, pubCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	pubCtx, pubCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer pubCancel()
 
-	// Publish an old message that should be filtered
-	_, err := js.Publish(pubCtx, testSubjectJetStream, []byte("old message"))
+	// 1. Publish "old" messages.
+	_, err := js.Publish(pubCtx, testSubjectJetStream, []byte("old message 1"))
 	if err != nil {
-		t.Fatalf("Failed to publish old message: %v", err)
+		t.Fatalf("Failed to publish old message 1: %v", err)
 	}
+	_, err = js.Publish(pubCtx, testSubjectJetStream, []byte("old message 2"))
+	if err != nil {
+		t.Fatalf("Failed to publish old message 2: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond) // Give NATS a moment to persist
 
-	time.Sleep(100 * time.Millisecond)
-	sinceTime := time.Now()
-	time.Sleep(100 * time.Millisecond)
+	// 2. Establish a clear 'sinceTime' boundary in the *future*.
+	// This ensures that when we truncate to seconds, the boundary is unambiguous.
+	sinceTime := time.Now().Add(time.Second).Truncate(time.Second)
 
-	// Publish a new message that should be received
+	// Wait until we are past the boundary time.
+	time.Sleep(time.Until(sinceTime) + 50*time.Millisecond)
+
+	// 3. Publish the "new message" clearly after the sinceTime boundary.
 	expectedPayload := "new message"
 	_, err = js.Publish(pubCtx, testSubjectJetStream, []byte(expectedPayload))
 	if err != nil {
 		t.Fatalf("Failed to publish new message: %v", err)
 	}
+	// Give the new message time to persist before we connect.
+	time.Sleep(100 * time.Millisecond)
 
 	handler := &NATS2SSEHandler{
 		natsConn:      nc,
@@ -263,7 +355,8 @@ func TestNATS2SSEHandler_JetStream_SinceFilter(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(handler.ServeHTTP))
 	defer server.Close()
 
-	sinceParam := sinceTime.UTC().Format(time.RFC3339)
+	// Format sinceTime using Unix seconds.
+	sinceParam := fmt.Sprintf("%d", sinceTime.Unix())
 	sseURL := fmt.Sprintf("%s?token=%s&subject=%s&since=%s", server.URL, testToken, testSubjectJetStream, sinceParam)
 	req, _ := http.NewRequest("GET", sseURL, nil)
 	ctx, cancelHTTP := context.WithTimeout(context.Background(), 5*time.Second)
@@ -281,7 +374,10 @@ func TestNATS2SSEHandler_JetStream_SinceFilter(t *testing.T) {
 		t.Fatalf("Expected status OK, got %d. Body: %s", resp.StatusCode, string(body))
 	}
 
-	receivedPayloads := readAllSSEResponses(t, ctx, resp.Body)
+	readCtx, readCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer readCancel()
+
+	receivedPayloads := readAllSSEResponses(t, readCtx, resp.Body)
 
 	if len(receivedPayloads) != 1 {
 		t.Fatalf("Expected to receive 1 message, but got %d. Payloads: %v", len(receivedPayloads), receivedPayloads)
