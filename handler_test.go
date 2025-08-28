@@ -227,7 +227,7 @@ func TestNATS2SSEHandler_JetStream_Embedded(t *testing.T) {
 	defer cleanup()
 	createTestStream(t, js, testStreamName, testSubjectJetStream)
 
-	handler := &NATS2SSEHandler{
+	handler := &Handler{
 		natsConn:    nc,
 		subjectFunc: testSubjectFunc,
 		logger:      log.New(io.Discard, "", 0),
@@ -345,7 +345,7 @@ func TestNATS2SSEHandler_JetStream_SinceFilter(t *testing.T) {
 	// Give the new message time to persist before we connect.
 	time.Sleep(100 * time.Millisecond)
 
-	handler := &NATS2SSEHandler{
+	handler := &Handler{
 		natsConn:      nc,
 		subjectFunc:   testSubjectFunc,
 		jetStreamName: testStreamName,
@@ -420,7 +420,7 @@ func TestNATS2SSEHandler_MessageCallback(t *testing.T) {
 		return msgData, nil // Allow as-is
 	}
 
-	handler := &NATS2SSEHandler{
+	handler := &Handler{
 		natsConn:        nc,
 		subjectFunc:     testSubjectFunc,
 		jetStreamName:   testStreamName,
