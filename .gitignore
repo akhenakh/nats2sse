@@ -1,0 +1,10 @@
+vendor
+*.sqlite
+*.gpkg
+*.gpkg-shm
+*.gpkg-wal
+bin
+.env
+.vscode
+.DS_Store
+cmd/server/server
