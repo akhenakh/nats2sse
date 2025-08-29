@@ -276,8 +276,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	logger.Info("Client subscribed to JetStream")
 
-	_ = sseWriter.SendComment("connection established, listening for events on " + subject)
-
 	var heartbeatTicker *time.Ticker
 	if h.heartbeat > 0 {
 		heartbeatTicker = time.NewTicker(h.heartbeat)
