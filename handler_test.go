@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -230,7 +230,7 @@ func TestNATS2SSEHandler_JetStream_Embedded(t *testing.T) {
 	handler := &Handler{
 		natsConn:    nc,
 		subjectFunc: testSubjectFunc,
-		logger:      log.New(io.Discard, "", 0),
+		logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 
 	server := httptest.NewServer(http.HandlerFunc(handler.ServeHTTP))
@@ -349,7 +349,7 @@ func TestNATS2SSEHandler_JetStream_SinceFilter(t *testing.T) {
 		natsConn:      nc,
 		subjectFunc:   testSubjectFunc,
 		jetStreamName: testStreamName,
-		logger:        log.New(io.Discard, "", 0),
+		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 
 	server := httptest.NewServer(http.HandlerFunc(handler.ServeHTTP))
@@ -424,7 +424,7 @@ func TestNATS2SSEHandler_MessageCallback(t *testing.T) {
 		natsConn:        nc,
 		subjectFunc:     testSubjectFunc,
 		jetStreamName:   testStreamName,
-		logger:          log.New(io.Discard, "", 0),
+		logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
 		messageCallback: callback,
 	}
 

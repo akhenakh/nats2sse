@@ -1,14 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -24,49 +26,53 @@ import (
 //go:embed static/index.html
 var indexHTML embed.FS
 
-// SimpleAuth is a basic authentication function.
+// SimpleAuth is the SubjectFunc for the handler.
+// It authenticates the request and determines the NATS subject and other parameters.
 // In a real app, you'd inspect r.Header.Get("Authorization") for a JWT, etc.
-// It expects a query parameter "subject" which dictates the subject.
 // Example: /events?subject=user123.updates -> subscribes to "user123.updates"
-// Example: /events?subject=jwt_token_here (decode JWT to get subject)
-func SimpleAuth(r *http.Request) (subject string, clientID string, err error) {
+// Example: /events?subject=user123.updates&since=1672531200 -> gets historical messages
+func SimpleAuth(r *http.Request) (subject string, clientID string, since *time.Time, err error) {
 	subjectParam := r.URL.Query().Get("subject")
 	if subjectParam == "" {
-		return "", "", errors.New("missing subject parameter")
+		return "", "", nil, errors.New("missing subject parameter")
+	}
+	if !isValidSubject(subjectParam) {
+		return "", "", nil, fmt.Errorf("invalid subject: %s", subjectParam)
 	}
 
-	// This is a placeholder. A real app would validate the token (e.g., JWT)
-	// and derive the subject and clientID from it.
-	// For this example, we'll use the subject itself as both the subject and clientID.
-	// Ensure the subject is safe and doesn't allow arbitrary subscriptions.
-	// e.g. if subject = "user123.data", subject = "user123.data"
-	// e.g. if subject = "jwt...", decode jwt, get userID, subject = "users." + userID + ".events"
+	// This is a placeholder for deriving a clientID. A real app might get it from a token.
+	// We'll use the subject as a basic, non-durable clientID.
+	clientID = subjectParam
 
-	return subjectParam, subjectParam, nil
+	// Handle optional 'since' parameter for historical messages
+	sinceStr := r.URL.Query().Get("since")
+	if sinceStr != "" {
+		epoch, errParse := strconv.ParseInt(sinceStr, 10, 64)
+		if errParse != nil {
+			return "", "", nil, fmt.Errorf("invalid 'since' parameter format (requires Unix epoch seconds): %w", errParse)
+		}
+		t := time.Unix(epoch, 0)
+		since = &t
+	}
+
+	return subjectParam, clientID, since, nil
 }
 
 // isValidSubject is a very basic validation.
-// NATS subjects are case-sensitive and cannot contain spaces.
-// Wildcards '>' and '*' have special meanings.
 func isValidSubject(subject string) bool {
-	if subject == "" || strings.ContainsAny(subject, " \t\r\n") {
-		return false
-	}
-	// Add more robust validation as needed, e.g., prevent overly broad wildcards
-	// if subject == ">" || subject == "*" { return false; }
-	return true
+	return subject != "" && !strings.ContainsAny(subject, " \t\r\n")
 }
 
 func main() {
 	natsURL := flag.String("nats_url", nats.DefaultURL, "NATS server URL")
-	useJetStream := flag.Bool("jetstream", false, "Use NATS JetStream")
-	streamName := flag.String("stream", "MY_EVENTS", "JetStream stream name (if using JetStream)")
+	streamName := flag.String("stream", "EVENTS", "JetStream stream name")
 	streamSubjects := flag.String("subjects", "events.>", "JetStream stream subjects (e.g., 'events.>')")
 	httpAddr := flag.String("http_addr", ":8080", "HTTP listen address")
-
 	flag.Parse()
 
-	logger := log.New(os.Stdout, "NATS2SSE_APP: ", log.LstdFlags|log.Lmicroseconds)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
 
 	// Connect to NATS
 	nc, err := nats.Connect(*natsURL,
@@ -74,107 +80,100 @@ func main() {
 		nats.ReconnectWait(2*time.Second),
 		nats.MaxReconnects(5),
 		nats.DisconnectErrHandler(func(nc *nats.Conn, err error) {
-			logger.Printf("NATS disconnected: %v", err)
+			logger.Warn("NATS disconnected", "error", err)
 		}),
 		nats.ReconnectHandler(func(nc *nats.Conn) {
-			logger.Printf("NATS reconnected to %s", nc.ConnectedUrl())
+			logger.Info("NATS reconnected", "url", nc.ConnectedUrl())
 		}),
 		nats.ClosedHandler(func(nc *nats.Conn) {
-			logger.Println("NATS connection closed.")
+			logger.Info("NATS connection closed.")
 		}),
 	)
 	if err != nil {
-		logger.Fatalf("Error connecting to NATS: %v", err)
+		logger.Error("Error connecting to NATS", "error", err)
+		os.Exit(1)
 	}
 	defer nc.Drain()
-	logger.Printf("Connected to NATS server: %s", nc.ConnectedUrl())
+	logger.Info("Connected to NATS server", "url", nc.ConnectedUrl())
 
-	logger.Println(*useJetStream)
-	// Setup JetStream Stream if enabled (optional, for testing)
-	if *useJetStream {
-		js, err := jetstream.New(nc)
-		if err != nil {
-			logger.Fatalf("Error creating JetStream context: %v", err)
-		}
+	// Setup JetStream Stream
+	js, err := jetstream.New(nc)
+	if err != nil {
+		logger.Error("Error creating JetStream context", "error", err)
+		os.Exit(1)
+	}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
+	ctx, cancelJsSetup := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelJsSetup()
 
-		_, err = js.CreateStream(ctx, jetstream.StreamConfig{
-			Name:     *streamName,
-			Subjects: []string{*streamSubjects}, // e.g., "events.>", "alerts.critical"
-			Storage:  jetstream.MemoryStorage,   // For example, use FileStorage for persistence
-		})
-		if err != nil {
-			// If stream already exists, that's often fine
-			if !errors.Is(err, jetstream.ErrStreamNameAlreadyInUse) && !strings.Contains(err.Error(), "stream name already in use") { // Workaround for slightly different error types/messages
-				logger.Fatalf("Error creating/updating JetStream stream %s: %v", *streamName, err)
-			} else {
-				logger.Printf("JetStream stream %s already exists or configured.", *streamName)
+	stream, err := js.Stream(ctx, *streamName)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrStreamNotFound) {
+			logger.Info("Creating JetStream stream", "streamName", *streamName, "subjects", *streamSubjects)
+			_, err = js.CreateStream(ctx, jetstream.StreamConfig{
+				Name:     *streamName,
+				Subjects: []string{*streamSubjects},
+				Storage:  jetstream.MemoryStorage, // Use FileStorage for persistence
+			})
+			if err != nil {
+				logger.Error("Error creating JetStream stream", "streamName", *streamName, "error", err)
+				os.Exit(1)
 			}
 		} else {
-			logger.Printf("JetStream stream %s created/updated with subjects [%s]", *streamName, *streamSubjects)
+			logger.Error("Error getting JetStream stream", "streamName", *streamName, "error", err)
+			os.Exit(1)
 		}
-
-		// Example publisher for JetStream
-		go func() {
-			ticker := time.NewTicker(1 * time.Second)
-			defer ticker.Stop()
-			i := 0
-			for range ticker.C {
-				// Example subjects that would match "events.>"
-				subj := fmt.Sprintf("events.typeA.%d", i)
-				payload := fmt.Sprintf("JS Hello %d from %s", i, subj)
-				_, pubErr := js.Publish(context.Background(), subj, []byte(payload))
-				if pubErr != nil {
-					logger.Printf("Error publishing to JetStream subject %s: %v", subj, pubErr)
-				} else {
-					logger.Printf("Published to JetStream: [%s] '%s'", subj, payload)
-				}
-				i++
-			}
-		}()
 	} else {
-		// Example publisher for Core NATS
-		go func() {
-			ticker := time.NewTicker(5 * time.Second)
-			defer ticker.Stop()
-			i := 0
-			for range ticker.C {
-				// Use a subject that SimpleAuth can authorize via token
-				subj := "public.messages"
-				payload := fmt.Sprintf("Core NATS Hello %d", i)
-				if pubErr := nc.Publish(subj, []byte(payload)); pubErr != nil {
-					logger.Printf("Error publishing to NATS subject %s: %v", subj, pubErr)
-				} else {
-					logger.Printf("Published to Core NATS: [%s] '%s'", subj, payload)
-				}
-				i++
-			}
-		}()
+		logger.Info("Using existing JetStream stream", "streamName", stream.CachedInfo().Config.Name)
 	}
 
-	// Configure NATS to SSE Handler
-	natsSSEHandler := &nats2sse.NATS2SSEHandler{
-		NATSConn:      nc,
-		Auth:          SimpleAuth,
-		IsJetStream:   *useJetStream,
-		JetStreamName: *streamName, // Important if IsJetStream is true and you want to bind
-		Heartbeat:     15 * time.Second,
-		Logger:        logger,
-		// Example of custom JetStream Consumer Options:
-		// JetStreamConsumerOpts: []jetstream.ConsumerOpt{
-		// 	jetstream.DeliverAll(), // Get all messages from the stream
-		// 	jetstream.AckExplicit(),
-		//  // For a shared durable consumer (clientID from AuthFunc must be stable and unique):
-		//  // jetstream.Durable(clientID), // clientID would need to be passed or determined
-		// },
-	}
+	// Example publisher for JetStream
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		i := 0
+		for range ticker.C {
+			subj := fmt.Sprintf("events.typeA.%d", i%5) // Cycle through a few subjects
+			payload := fmt.Sprintf("JS Hello %d from %s", i, subj)
+			_, pubErr := js.Publish(ctx, subj, []byte(payload))
+			if pubErr != nil {
+				logger.Warn("Error publishing to JetStream", "subject", subj, "error", pubErr)
+			} else {
+				logger.Info("Published to JetStream", "subject", subj, "payload", payload)
+			}
+			i++
+		}
+	}()
+
+	// Configure NATS to SSE Handler using the new functional options
+	sseHandler := nats2sse.NewHandler(
+		nats2sse.WithNATSConnection(nc),
+		nats2sse.WithSubjectFunc(SimpleAuth),
+		nats2sse.WithJetStreamName(*streamName),
+		nats2sse.WithHeartbeat(15*time.Second),
+		nats2sse.WithLogger(logger),
+		// Example of customizing the JetStream consumer for each client
+		nats2sse.WithJetStreamConsumerConfigurator(func(config *jetstream.ConsumerConfig, subject string, clientID string) {
+			// For example, if a clientID is passed that indicates durability:
+			if strings.HasPrefix(clientID, "durable-") {
+				config.Durable = clientID
+				config.DeliverPolicy = jetstream.DeliverLastPolicy // Resume from last received message
+			}
+		}),
+		// Example of processing messages before they are sent to the client
+		nats2sse.WithMessageCallback(func(ctx context.Context, clientID, subject string, headers nats.Header, msgData []byte) ([]byte, error) {
+			logger.Debug("Message callback invoked", "clientID", clientID, "subject", subject)
+			// To filter a message, return nil data
+			if bytes.Contains(msgData, []byte("internal")) {
+				return nil, nil
+			}
+			// To modify a message, return new data
+			return append([]byte("processed: "), msgData...), nil
+		}),
+	)
 
 	mux := http.NewServeMux()
-	mux.Handle("/events", natsSSEHandler) // All requests to /events go to our handler
-
-	// Serve static files
+	mux.Handle("/events", sseHandler)
 	mux.Handle("/", http.FileServer(http.FS(indexHTML)))
 
 	// Start HTTP Server
@@ -184,9 +183,11 @@ func main() {
 	}
 
 	go func() {
-		logger.Printf("Starting HTTP server on %s", *httpAddr)
+		logger.Info("Starting HTTP server", "address", *httpAddr)
+		logger.Info("Try opening http://localhost:8080 in your browser")
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Fatalf("HTTP server ListenAndServe: %v", err)
+			logger.Error("HTTP server ListenAndServe", "error", err)
+			os.Exit(1)
 		}
 	}()
 
@@ -194,14 +195,14 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-	logger.Println("Shutting down server...")
+	logger.Info("Shutting down server...")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	if err := server.Shutdown(ctx); err != nil {
-		logger.Fatalf("Server forced to shutdown: %v", err)
+		logger.Error("Server forced to shutdown", "error", err)
 	}
 
-	logger.Println("Server exiting")
+	logger.Info("Server exiting")
 }
