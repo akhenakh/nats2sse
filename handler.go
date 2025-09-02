@@ -140,7 +140,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Create a logger with client-specific context
 	logger = logger.With("clientID", clientID, "subject", subject)
-	logger.Info("Client authenticated")
+	logger.Debug("Client authenticated")
 
 	sseWriter, err := NewSSEWriter(w)
 	if err != nil {
@@ -157,7 +157,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var sub *jetStreamSubscription
 	defer func() {
 		if sub != nil {
-			logger.Info("Unsubscribing client")
+			logger.Debug("Unsubscribing client")
 			if errUnsub := sub.Unsubscribe(); errUnsub != nil {
 				logger.Error("Error during unsubscription", "error", errUnsub)
 			}
@@ -208,7 +208,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if since != nil && !since.IsZero() {
 		consumerConfig.DeliverPolicy = jetstream.DeliverByStartTimePolicy
 		consumerConfig.OptStartTime = since
-		logger.Info("Consumer configured to deliver messages from a start time", "since", since.Format(time.RFC3339))
+		logger.Debug("Consumer configured to deliver messages from a start time", "since", since.Format(time.RFC3339))
 	}
 
 	if h.jetStreamConsumerConfigurator != nil {
@@ -287,7 +287,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case <-ctx.Done():
-			logger.Info("Client disconnected, terminating loop")
+			logger.Debug("Client disconnected, terminating loop")
 			return
 		case chMsg, ok := <-msgChan:
 			if !ok {
@@ -373,9 +373,7 @@ func (s *jetStreamSubscription) Unsubscribe() error {
 				logger.Debug("Ephemeral consumer not found during deletion, likely already removed")
 			} else {
 				logger.Error("Failed to delete ephemeral JetStream consumer", "error", err)
-				if firstErr == nil {
-					firstErr = err
-				}
+				firstErr = err
 			}
 		}
 	} else if s.isEphemeral {
